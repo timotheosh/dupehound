@@ -91,22 +91,45 @@ fn is_rust_trait_impl_method(func: Node) -> bool {
     impl_item.kind() == "impl_item" && impl_item.child_by_field_name("trait").is_some()
 }
 
+/// The text of `list`'s head symbol, if its first value child is a plain
+/// symbol — the macro/function name a Clojure list form starts with, e.g.
+/// "defmethod" or "defrecord".
+fn clojure_list_head_text<'a>(list: Node, src: &'a str) -> Option<&'a str> {
+    let head = list.child_by_field_name("value")?;
+    if head.kind() != "sym_lit" {
+        return None;
+    }
+    head.child_by_field_name("name")?
+        .utf8_text(src.as_bytes())
+        .ok()
+}
+
 /// True if `func` is a Clojure `defmethod` form. Every defmethod for the
 /// same multimethod shares its `.name` (the multimethod name) by
 /// construction — one form per dispatch value — so near-duplicate dispatch
 /// branches can't be merged away. Same situation as `is_rust_trait_impl_method`
 /// above, reusing the same flag rather than inventing a Clojure-specific one.
 fn is_clojure_defmethod(func: Node, src: &str) -> bool {
-    let Some(head) = func.child_by_field_name("value") else {
+    clojure_list_head_text(func, src) == Some("defmethod")
+}
+
+/// True if `func`'s immediate parent is a defrecord/deftype/extend-type/
+/// extend-protocol/reify form -- a protocol method implementation, whose
+/// name is shared with every other type's implementation of the same
+/// method by construction. Same reasoning as `is_rust_trait_impl_method`
+/// and `is_clojure_defmethod`: reuses `is_trait_impl_method` rather than a
+/// third flag.
+fn is_clojure_protocol_method(func: Node, src: &str) -> bool {
+    let Some(parent) = func.parent() else {
         return false;
     };
-    if head.kind() != "sym_lit" {
+    if parent.kind() != "list_lit" {
         return false;
     }
-    let Some(name) = head.child_by_field_name("name") else {
-        return false;
-    };
-    name.utf8_text(src.as_bytes()) == Ok("defmethod")
+    matches!(
+        clojure_list_head_text(parent, src),
+        Some("defrecord" | "deftype" | "extend-type" | "extend-protocol" | "reify")
+    )
 }
 
 /// Extract and fingerprint every function in `src`. `file` is the caller's
@@ -174,7 +197,9 @@ pub fn analyze_source(
         let is_test = file_is_test || test_boundary.is_some_and(|b| func.start_byte() as u32 >= b);
         let is_trait_impl_method = match lang {
             Lang::Rust => is_rust_trait_impl_method(func),
-            Lang::Clojure => is_clojure_defmethod(func, src),
+            Lang::Clojure => {
+                is_clojure_defmethod(func, src) || is_clojure_protocol_method(func, src)
+            }
             _ => false,
         };
         functions.push(FunctionUnit {
@@ -656,6 +681,124 @@ function describeUser(user: { name: string; age: number }): string {
         let dispatch = fa.functions.iter().find(|f| f.name == "area").unwrap();
         assert!(!plain.is_trait_impl_method);
         assert!(dispatch.is_trait_impl_method);
+    }
+
+    #[test]
+    fn clojure_protocol_methods_are_captured() {
+        let src = r#"
+(defrecord DefaultShellExecutor []
+  ShellExecutor
+
+  (run-cmd [_this cmd args opts]
+    (assoc opts :cmd cmd)))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        assert_eq!(fa.functions.len(), 1);
+        assert_eq!(fa.functions[0].name, "run-cmd");
+    }
+
+    #[test]
+    fn clojure_protocol_method_renamed_clone_has_identical_fingerprints() {
+        // Two records implementing the same protocol method, same logic,
+        // renamed locals only -- the standard type-2-clone guarantee every
+        // other captured Clojure form already has.
+        let src = r#"
+(defrecord DefaultShellExecutor []
+  ShellExecutor
+
+  (run-cmd [_this cmd args opts]
+    (let [env-map (get opts :env {})]
+      (assoc opts :cmd cmd :env env-map))))
+
+(defrecord LoggingShellExecutor []
+  ShellExecutor
+
+  (run-cmd [_this command arguments options]
+    (let [env-vars (get options :env {})]
+      (assoc options :cmd command :env env-vars))))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
+    #[test]
+    fn clojure_protocol_method_is_flagged_like_a_trait_impl_method() {
+        // Mirrors clojure_defmethod_is_flagged_like_a_trait_impl_method: a
+        // plain defn isn't flagged, a protocol method implementation is --
+        // its name is shared with every other type's implementation of the
+        // same method by construction.
+        let src = r#"
+(defn plain-run [cmd]
+  (assoc {} :cmd cmd))
+
+(defrecord DefaultShellExecutor []
+  ShellExecutor
+
+  (run-cmd [_this cmd args opts]
+    (assoc opts :cmd cmd)))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        let plain = fa.functions.iter().find(|f| f.name == "plain-run").unwrap();
+        let method = fa.functions.iter().find(|f| f.name == "run-cmd").unwrap();
+        assert!(!plain.is_trait_impl_method);
+        assert!(method.is_trait_impl_method);
+    }
+
+    #[test]
+    fn clojure_vector_arg_call_is_not_a_protocol_method() {
+        // The concrete false-positive guard: (zipmap [:a :b] [1 2]) is
+        // shaped exactly like a protocol method -- symbol, then a vector --
+        // but it's nested inside caller's own body, not a direct child of a
+        // defrecord/deftype/.../reify form, so it must not match.
+        let src = r#"
+(defn caller []
+  (zipmap [:a :b] [1 2]))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        let names: Vec<&str> = fa.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["caller"]);
+    }
+
+    #[test]
+    fn clojure_extend_type_extend_protocol_and_reify_methods_are_captured() {
+        let src = r#"
+(extend-type MyType
+  ShellExecutor
+  (run-cmd [this cmd args opts]
+    (do-thing cmd)))
+
+(extend-protocol ShellExecutor
+  AnotherType
+  (run-cmd [this cmd args opts]
+    (do-thing cmd))
+  ThirdType
+  (run-cmd [this cmd args opts]
+    (do-other cmd)))
+
+(defn make-inline-executor []
+  (reify ShellExecutor
+    (run-cmd [this cmd args opts]
+      (do-thing cmd))))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        // extend-type: 1 run-cmd, extend-protocol: 2 (AnotherType + ThirdType),
+        // reify: 1 run-cmd -- plus make-inline-executor itself, the ordinary
+        // defn that wraps the reify expression.
+        let run_cmds: Vec<_> = fa
+            .functions
+            .iter()
+            .filter(|f| f.name == "run-cmd")
+            .collect();
+        assert_eq!(run_cmds.len(), 4);
+        assert!(run_cmds.iter().all(|f| f.is_trait_impl_method));
+        let wrapper = fa
+            .functions
+            .iter()
+            .find(|f| f.name == "make-inline-executor")
+            .unwrap();
+        assert!(!wrapper.is_trait_impl_method);
+        assert_eq!(fa.functions.len(), 5);
     }
 
     const CS_CLASSES: &str = r#"
