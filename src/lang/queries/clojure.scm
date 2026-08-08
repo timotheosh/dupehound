@@ -4,7 +4,7 @@
   .
   (sym_lit name: (sym_name) @name)
   .
-  (#any-of? @_kw "defn" "defn-" "defmacro" "deftest")) @func @body
+  (#any-of? @_kw "defn" "defn-" "defmacro" "deftest" "defmulti" "defmethod")) @func @body
 
 ; (def name (fn [args] ...)) -- a function value bound via def instead of
 ; defn. Mirrors javascript.scm's variable_declarator pattern: only fn-valued

@@ -30,9 +30,12 @@ pub struct FunctionUnit {
     /// Sorted, distinct winnowing fingerprints of the body.
     pub fingerprints: Vec<u64>,
     pub is_test: bool,
-    /// Rust only: a method inside an `impl Trait for Type` block. Every impl
-    /// of the same trait shares the method name (`from`, `fmt`, ...) by
-    /// definition, so these are near-duplicates that cannot be merged.
+    /// A method whose name is shared with its near-duplicate siblings by
+    /// construction, so the sharing is required rather than accidental and
+    /// the cluster can't be merged away: a Rust method inside an `impl
+    /// Trait for Type` block (every impl of the same trait shares the
+    /// method name — `from`, `fmt`, ...) or a Clojure `defmethod` dispatch
+    /// branch (every branch of the same multimethod shares its name).
     pub is_trait_impl_method: bool,
 }
 
@@ -86,6 +89,24 @@ fn is_rust_trait_impl_method(func: Node) -> bool {
         return false;
     };
     impl_item.kind() == "impl_item" && impl_item.child_by_field_name("trait").is_some()
+}
+
+/// True if `func` is a Clojure `defmethod` form. Every defmethod for the
+/// same multimethod shares its `.name` (the multimethod name) by
+/// construction — one form per dispatch value — so near-duplicate dispatch
+/// branches can't be merged away. Same situation as `is_rust_trait_impl_method`
+/// above, reusing the same flag rather than inventing a Clojure-specific one.
+fn is_clojure_defmethod(func: Node, src: &str) -> bool {
+    let Some(head) = func.child_by_field_name("value") else {
+        return false;
+    };
+    if head.kind() != "sym_lit" {
+        return false;
+    }
+    let Some(name) = head.child_by_field_name("name") else {
+        return false;
+    };
+    name.utf8_text(src.as_bytes()) == Ok("defmethod")
 }
 
 /// Extract and fingerprint every function in `src`. `file` is the caller's
@@ -151,7 +172,11 @@ pub fn analyze_source(
             .unwrap_or("<anonymous>")
             .to_string();
         let is_test = file_is_test || test_boundary.is_some_and(|b| func.start_byte() as u32 >= b);
-        let is_trait_impl_method = lang == Lang::Rust && is_rust_trait_impl_method(func);
+        let is_trait_impl_method = match lang {
+            Lang::Rust => is_rust_trait_impl_method(func),
+            Lang::Clojure => is_clojure_defmethod(func, src),
+            _ => false,
+        };
         functions.push(FunctionUnit {
             file,
             lang,
@@ -590,6 +615,47 @@ function describeUser(user: { name: string; age: number }): string {
         let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
         assert_eq!(fa.functions.len(), 2);
         assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
+    #[test]
+    fn clojure_defmulti_and_defmethod_are_captured() {
+        let src = r#"
+(defmulti area (fn [shape] (:type shape)))
+
+(defmethod area :circle [shape]
+  (* Math/PI (:radius shape) (:radius shape)))
+
+(defmethod area :square [shape]
+  (* (:side shape) (:side shape)))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        let names: Vec<&str> = fa.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["area", "area", "area"]);
+    }
+
+    #[test]
+    fn clojure_defmethod_is_flagged_like_a_trait_impl_method() {
+        // Mirrors rust_trait_impl_methods_are_flagged below: a plain defn
+        // and a defmethod dispatch branch. Only the defmethod is flagged --
+        // every dispatch branch of the same multimethod shares its name by
+        // construction, so near-duplicate branches can't be merged away,
+        // the same reasoning as a Rust trait impl.
+        let src = r#"
+(defn plain-area [shape]
+  (* (:side shape) (:side shape)))
+
+(defmethod area :circle [shape]
+  (* Math/PI (:radius shape) (:radius shape)))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        let plain = fa
+            .functions
+            .iter()
+            .find(|f| f.name == "plain-area")
+            .unwrap();
+        let dispatch = fa.functions.iter().find(|f| f.name == "area").unwrap();
+        assert!(!plain.is_trait_impl_method);
+        assert!(dispatch.is_trait_impl_method);
     }
 
     const CS_CLASSES: &str = r#"
