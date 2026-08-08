@@ -517,6 +517,81 @@ function describeUser(user: { name: string; age: number }): string {
         assert!(j < 0.3, "unrelated functions scored {j}");
     }
 
+    #[test]
+    fn clojure_deftest_forms_are_captured() {
+        // clojure.test's `deftest` isn't literally `defn`, so it needs its
+        // own arm in the query's #any-of? list — without it, every deftest
+        // in a real codebase's test suite is invisible to dupehound.
+        let src = r#"
+(defn add-one [x]
+  (+ x 1))
+
+(deftest add-one-test
+  (testing "adds one"
+    (is (= 2 (add-one 1)))
+    (is (= 3 (add-one 2)))))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 5, false).unwrap();
+        let names: Vec<&str> = fa.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["add-one", "add-one-test"]);
+    }
+
+    #[test]
+    fn clojure_def_bound_fn_is_captured() {
+        // (def name (fn [args] ...)) is the def+fn idiom, equivalent to
+        // (defn name [args] ...) -- mirrors javascript.scm's
+        // variable_declarator pattern for `const name = () => {...}`.
+        // len() == 1, not 2: dupehound intentionally has no bare/anonymous
+        // -fn pattern (same javascript.scm precedent -- arrow functions are
+        // only matched when bound to a name), so the inner (fn ...) node
+        // is captured exactly once, by this pattern alone.
+        let src = r#"
+(def add-one (fn [x]
+  (+ x 1)))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        assert_eq!(fa.functions.len(), 1);
+        assert_eq!(fa.functions[0].name, "add-one");
+    }
+
+    #[test]
+    fn clojure_plain_def_is_not_a_function() {
+        // (def x 5) and (def config {...}) bind data, not a function value
+        // -- only a def whose value is (fn ...) should match.
+        let src = r#"
+(def just-data
+  {:a 1 :b 2})
+
+(def aliased +)
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        assert!(
+            fa.functions.is_empty(),
+            "expected no functions, got {:?}",
+            fa.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn clojure_def_bound_fn_renamed_clone_has_identical_fingerprints() {
+        // Two def+fn functions, same shape, renamed variable/parameter --
+        // the def+fn idiom needs the same type-2-clone guarantee defn
+        // already has. (defn and def+fn are NOT expected to match each
+        // other: def+fn's body is just the inner (fn ...) node, so it has
+        // no equivalent to defn's own leading "defn"/name tokens -- they're
+        // different shapes, not the same stream.)
+        let src = r#"
+(def add-one (fn [x]
+  (+ x 1)))
+
+(def increment (fn [y]
+  (+ y 1)))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 1, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
     const CS_CLASSES: &str = r#"
 public class Customer {
     public int Id { get; set; }
