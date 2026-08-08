@@ -138,7 +138,7 @@ pub fn analyze_source(
         let (Some(body), Some(func)) = (body, func) else {
             continue;
         };
-        let normalized = normalize(body);
+        let normalized = normalize(body, src.as_bytes());
         if normalized.codes.len() < min_tokens {
             continue;
         }
@@ -439,6 +439,82 @@ function describeUser(user: { name: string; age: number }): string {
         let fa1 = analyze_source(0, Lang::Typescript, without, 5, false).unwrap();
         let fa2 = analyze_source(0, Lang::Typescript, with, 5, false).unwrap();
         assert_eq!(fa1.functions[0].fingerprints, fa2.functions[0].fingerprints);
+    }
+
+    // Clojure's grammar represents operators, special forms, macros, and
+    // ordinary identifiers with the same `sym_name` node kind — unlike every
+    // other supported grammar, which gives keywords/operators their own
+    // distinct kinds separate from `identifier`. These two tests are the
+    // real regression guard for that: the TypeScript pair above proves
+    // normalization's core invariant once; this proves it still holds once
+    // a language can't lean on kind-name alone to tell "+" from "x".
+    const CLOJURE_PAIR: &str = r#"
+(defn sum-items [items factor]
+  (let [total (reduce (fn [acc item]
+                         (let [value (* (:price item) (:qty item))]
+                           (if (:discount item)
+                             (+ acc (* value (- 1.0 (:discount item))))
+                             (+ acc value))))
+                       0.0
+                       items)]
+    (+ total (* total factor))))
+
+(defn combine-totals [rows scale]
+  (let [sum (reduce (fn [acc row]
+                       (let [amount (* (:price row) (:qty row))]
+                         (if (:discount row)
+                           (+ acc (* amount (- 1.0 (:discount row))))
+                           (+ acc amount))))
+                     0.0
+                     rows)]
+    (+ sum (* sum scale))))
+"#;
+
+    #[test]
+    fn clojure_renamed_clone_has_identical_fingerprints() {
+        // Same shape, every local variable/parameter renamed, operators and
+        // special forms (defn, let, reduce, fn, if, +, *, -) untouched — a
+        // textbook type-2 clone.
+        let fa = analyze_source(0, Lang::Clojure, CLOJURE_PAIR, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
+    #[test]
+    fn clojure_different_logic_does_not_match() {
+        // Same nesting shape, same literal-type pattern, but different verbs
+        // throughout (max/when/min/- instead of */if/+). Before TokenClass::Op
+        // exists, every symbol collapses to the same code regardless of kind,
+        // so this is expected to FAIL — it's the concrete proof the fix does
+        // what it claims once it lands.
+        let src = r#"
+(defn sum-items [items factor]
+  (let [total (reduce (fn [acc item]
+                         (let [value (* (:price item) (:qty item))]
+                           (if (:discount item)
+                             (+ acc (* value (- 1.0 (:discount item))))
+                             (+ acc value))))
+                       0.0
+                       items)]
+    (+ total (* total factor))))
+
+(defn max-items [items factor]
+  (let [total (reduce (fn [acc item]
+                         (let [value (max (:price item) (:qty item))]
+                           (when (:discount item)
+                             (- acc (min value (/ 1.0 (:discount item)))))
+                           (- acc value)))
+                       0.0
+                       items)]
+    (- total (/ total factor))))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        let j = crate::fingerprint::jaccard(
+            &fa.functions[0].fingerprints,
+            &fa.functions[1].fingerprints,
+        );
+        assert!(j < 0.3, "unrelated functions scored {j}");
     }
 
     const CS_CLASSES: &str = r#"

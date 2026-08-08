@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use tree_sitter::{Language, Query};
+use tree_sitter::{Language, Node, Query};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -168,14 +168,34 @@ pub enum TokenClass {
     Comment,
     /// Structure (keywords, operators, punctuation): kept verbatim by kind id.
     Other,
+    /// Operator/special-form/macro symbol in a grammar too coarse to give it
+    /// its own node kind (e.g. Clojure's `sym_name`, used for `+`, `if`,
+    /// `reduce` and ordinary identifiers alike): kept verbatim by hashed
+    /// text, since kind id alone can't distinguish it from an identifier.
+    Op,
 }
 
-/// Classify a leaf node kind name. Kind-name conventions are consistent
-/// enough across the bundled grammars that substring rules beat per-grammar
-/// tables — and they survive grammar upgrades better.
-pub fn classify(kind: &str) -> TokenClass {
+/// Classify a leaf node. Kind-name conventions are consistent enough across
+/// the bundled grammars that substring rules on `leaf.kind()` beat
+/// per-grammar tables for almost everything — and they survive grammar
+/// upgrades better.
+///
+/// Clojure is the exception: its `sym_name` node covers call heads, special
+/// forms, macros, functions, and local variables alike, so kind name alone
+/// can't separate "operator" from "identifier" the way every other
+/// supported grammar's node kinds do. `is_clojure_call_head` breaks the tie
+/// using the leaf's position instead — hence this function takes the whole
+/// `Node`, not just its kind string.
+pub fn classify(leaf: Node) -> TokenClass {
+    let kind = leaf.kind();
     if kind.contains("comment") {
         TokenClass::Comment
+    } else if kind == "sym_name" {
+        if leaf.parent().is_some_and(is_clojure_call_head) {
+            TokenClass::Op
+        } else {
+            TokenClass::Ident
+        }
     } else if kind.contains("identifier") || kind == "shorthand_property_identifier_pattern" {
         TokenClass::Ident
     } else if kind.contains("string")
@@ -184,6 +204,7 @@ pub fn classify(kind: &str) -> TokenClass {
         || kind == "escape_sequence"
         || kind == "template_chars"
         || kind == "str_lit"
+        || kind == "kwd_name"
         || kind == "\""
         || kind == "'"
         || kind == "`"
@@ -201,6 +222,24 @@ pub fn classify(kind: &str) -> TokenClass {
     } else {
         TokenClass::Other
     }
+}
+
+/// True if `sym_lit` occupies the head (first) position of a Clojure list
+/// form — `(reduce ...)`, `(if ...)`, `(+ ...)` — meaning the symbol names
+/// the operator/special-form/macro being invoked rather than referencing a
+/// bound value. Deliberately Clojure-grammar-specific (it names
+/// `list_lit`/`value` directly): a second Lisp dialect should get its own
+/// version of this function against its own grammar's node shape, not a
+/// generalization of this one.
+fn is_clojure_call_head(sym_lit: Node) -> bool {
+    let Some(list) = sym_lit.parent() else {
+        return false;
+    };
+    if list.kind() != "list_lit" {
+        return false;
+    }
+    list.child_by_field_name("value")
+        .is_some_and(|first| first.id() == sym_lit.id())
 }
 
 #[cfg(test)]
