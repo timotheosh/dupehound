@@ -131,6 +131,90 @@ def calculateAmount(rows: List[Map[String, Double]], vat: Double): Double = {
 "#,
 };
 
+const COMMONLISP: Fixture = Fixture {
+    file_a: "billing.lisp",
+    file_b: "invoices.lisp",
+    names: ("compute-total", "calculate-amount"),
+    src_a: r#"
+(defun compute-total (items tax-rate)
+  (let ((subtotal 0.0))
+    (dolist (item items)
+      (let ((price (* (getf item :price) (getf item :qty))))
+        (when (getf item :discount)
+          (setf price (* price (- 1.0 (getf item :discount)))))
+        (setf subtotal (+ subtotal price))))
+    (let ((tax (* subtotal tax-rate)))
+      (+ subtotal tax))))
+"#,
+    src_b: r#"
+(defun calculate-amount (rows vat)
+  (let ((base 0.0))
+    (dolist (row rows)
+      (let ((cost (* (getf row :price) (getf row :qty))))
+        (when (getf row :discount)
+          (setf cost (* cost (- 1.0 (getf row :discount)))))
+        (setf base (+ base cost))))
+    (let ((extra (* base vat)))
+      (+ base extra))))
+"#,
+};
+
+const ELISP: Fixture = Fixture {
+    file_a: "billing.el",
+    file_b: "invoices.el",
+    names: ("compute-total", "calculate-amount"),
+    src_a: r#"
+(defun compute-total (items tax-rate)
+  (let ((subtotal (seq-reduce (lambda (acc item)
+                                 (let ((price (* (plist-get item :price) (plist-get item :qty))))
+                                   (if (plist-get item :discount)
+                                       (+ acc (* price (- 1.0 (plist-get item :discount))))
+                                     (+ acc price))))
+                               items
+                               0.0)))
+    (+ subtotal (* subtotal tax-rate))))
+"#,
+    src_b: r#"
+(defun calculate-amount (rows vat)
+  (let ((base (seq-reduce (lambda (acc row)
+                             (let ((cost (* (plist-get row :price) (plist-get row :qty))))
+                               (if (plist-get row :discount)
+                                   (+ acc (* cost (- 1.0 (plist-get row :discount))))
+                                 (+ acc cost))))
+                           rows
+                           0.0)))
+    (+ base (* base vat))))
+"#,
+};
+
+const CLOJURE: Fixture = Fixture {
+    file_a: "billing.clj",
+    file_b: "invoices.clj",
+    names: ("compute-total", "calculate-amount"),
+    src_a: r#"
+(defn compute-total [items tax-rate]
+  (let [subtotal (reduce (fn [acc item]
+                            (let [price (* (:price item) (:qty item))]
+                              (if (:discount item)
+                                (+ acc (* price (- 1.0 (:discount item))))
+                                (+ acc price))))
+                          0.0
+                          items)]
+    (+ subtotal (* subtotal tax-rate))))
+"#,
+    src_b: r#"
+(defn calculate-amount [rows vat]
+  (let [base (reduce (fn [acc row]
+                        (let [cost (* (:price row) (:qty row))]
+                          (if (:discount row)
+                            (+ acc (* cost (- 1.0 (:discount row))))
+                            (+ acc cost))))
+                      0.0
+                      rows)]
+    (+ base (* base vat))))
+"#,
+};
+
 const KOTLIN: Fixture = Fixture {
     file_a: "Billing.kt",
     file_b: "Invoices.kt",
@@ -676,6 +760,18 @@ fn kotlin_renamed_clone_is_detected() {
 #[test]
 fn scala_renamed_clone_is_detected() {
     assert_clone_pair_detected(&SCALA);
+}
+#[test]
+fn commonlisp_renamed_clone_is_detected() {
+    assert_clone_pair_detected(&COMMONLISP);
+}
+#[test]
+fn elisp_renamed_clone_is_detected() {
+    assert_clone_pair_detected(&ELISP);
+}
+#[test]
+fn clojure_renamed_clone_is_detected() {
+    assert_clone_pair_detected(&CLOJURE);
 }
 #[test]
 fn c_pointer_return_clone_is_detected() {

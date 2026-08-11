@@ -138,7 +138,7 @@ pub fn analyze_source(
         let (Some(body), Some(func)) = (body, func) else {
             continue;
         };
-        let normalized = normalize(body);
+        let normalized = normalize(body, src.as_bytes());
         if normalized.codes.len() < min_tokens {
             continue;
         }
@@ -169,7 +169,7 @@ pub fn analyze_source(
 
     Some(FileAnalysis {
         functions,
-        sig_lines: significant_lines(root),
+        sig_lines: significant_lines(root, src.as_bytes()),
         total_lines: src.lines().count() as u32,
     })
 }
@@ -424,6 +424,214 @@ function describeUser(user: { name: string; age: number }): string {
 }
 "#;
         let fa = analyze_source(0, Lang::Typescript, src, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        let j = crate::fingerprint::jaccard(
+            &fa.functions[0].fingerprints,
+            &fa.functions[1].fingerprints,
+        );
+        assert!(j < 0.3, "unrelated functions scored {j}");
+    }
+
+    // Common Lisp and Emacs Lisp both give operators, special forms,
+    // function calls, and ordinary identifiers the same node kind
+    // (`sym_lit` / `symbol`) — unlike every other supported grammar, which
+    // gives keywords/operators their own kind separate from `identifier`.
+    // These pairs are the real regression guard for that (is_commonlisp_call_head
+    // / is_elisp_call_head in src/lang/mod.rs): the TypeScript pair above
+    // proves normalization's core invariant once; these prove it still
+    // holds once a language can't lean on kind-name alone to tell `+` from
+    // `x`.
+    const COMMONLISP_PAIR: &str = r#"
+(defun sum-items (items factor)
+  (let ((total (reduce (lambda (acc item)
+                          (let ((value (* (getf item :price) (getf item :qty))))
+                            (if (getf item :discount)
+                                (+ acc (* value (- 1.0 (getf item :discount))))
+                                (+ acc value))))
+                        items
+                        :initial-value 0.0)))
+    (+ total (* total factor))))
+
+(defun combine-totals (rows scale)
+  (let ((sum (reduce (lambda (acc row)
+                        (let ((amount (* (getf row :price) (getf row :qty))))
+                          (if (getf row :discount)
+                              (+ acc (* amount (- 1.0 (getf row :discount))))
+                              (+ acc amount))))
+                      rows
+                      :initial-value 0.0)))
+    (+ sum (* sum scale))))
+"#;
+
+    #[test]
+    fn commonlisp_renamed_clone_has_identical_fingerprints() {
+        // Same shape, every local variable/parameter/function name renamed,
+        // operators and special forms (defun, let, reduce, lambda, if, +,
+        // *, -) untouched — a textbook type-2 clone.
+        let fa = analyze_source(0, Lang::CommonLisp, COMMONLISP_PAIR, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
+    #[test]
+    fn commonlisp_different_logic_does_not_match() {
+        // Same nesting shape, same literal-type pattern, but different
+        // verbs throughout (max/when/min/- instead of */if/+).
+        let src = r#"
+(defun sum-items (items factor)
+  (let ((total (reduce (lambda (acc item)
+                          (let ((value (* (getf item :price) (getf item :qty))))
+                            (if (getf item :discount)
+                                (+ acc (* value (- 1.0 (getf item :discount))))
+                                (+ acc value))))
+                        items
+                        :initial-value 0.0)))
+    (+ total (* total factor))))
+
+(defun max-items (items factor)
+  (let ((total (reduce (lambda (acc item)
+                          (let ((value (max (getf item :price) (getf item :qty))))
+                            (when (getf item :discount)
+                              (- acc (min value (/ 1.0 (getf item :discount)))))
+                            (- acc value)))
+                        items
+                        :initial-value 0.0)))
+    (- total (/ total factor))))
+"#;
+        let fa = analyze_source(0, Lang::CommonLisp, src, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        let j = crate::fingerprint::jaccard(
+            &fa.functions[0].fingerprints,
+            &fa.functions[1].fingerprints,
+        );
+        assert!(j < 0.3, "unrelated functions scored {j}");
+    }
+
+    const ELISP_PAIR: &str = r#"
+(defun sum-items (items factor)
+  (let ((total (seq-reduce (lambda (acc item)
+                              (let ((value (* (plist-get item :price) (plist-get item :qty))))
+                                (if (plist-get item :discount)
+                                    (+ acc (* value (- 1.0 (plist-get item :discount))))
+                                  (+ acc value))))
+                            items
+                            0.0)))
+    (+ total (* total factor))))
+
+(defun combine-totals (rows scale)
+  (let ((sum (seq-reduce (lambda (acc row)
+                            (let ((amount (* (plist-get row :price) (plist-get row :qty))))
+                              (if (plist-get row :discount)
+                                  (+ acc (* amount (- 1.0 (plist-get row :discount))))
+                                (+ acc amount))))
+                          rows
+                          0.0)))
+    (+ sum (* sum scale))))
+"#;
+
+    #[test]
+    fn elisp_renamed_clone_has_identical_fingerprints() {
+        let fa = analyze_source(0, Lang::Elisp, ELISP_PAIR, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
+    #[test]
+    fn elisp_different_logic_does_not_match() {
+        let src = r#"
+(defun sum-items (items factor)
+  (let ((total (seq-reduce (lambda (acc item)
+                              (let ((value (* (plist-get item :price) (plist-get item :qty))))
+                                (if (plist-get item :discount)
+                                    (+ acc (* value (- 1.0 (plist-get item :discount))))
+                                  (+ acc value))))
+                            items
+                            0.0)))
+    (+ total (* total factor))))
+
+(defun max-items (items factor)
+  (let ((total (seq-reduce (lambda (acc item)
+                              (let ((value (max (plist-get item :price) (plist-get item :qty))))
+                                (when (plist-get item :discount)
+                                  (- acc (min value (/ 1.0 (plist-get item :discount)))))
+                                (- acc value)))
+                            items
+                            0.0)))
+    (- total (/ total factor))))
+"#;
+        let fa = analyze_source(0, Lang::Elisp, src, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        let j = crate::fingerprint::jaccard(
+            &fa.functions[0].fingerprints,
+            &fa.functions[1].fingerprints,
+        );
+        assert!(j < 0.3, "unrelated functions scored {j}");
+    }
+
+    // Clojure's grammar represents operators, special forms, macros, and
+    // ordinary identifiers with the same `sym_name` node kind — unlike every
+    // other supported grammar, which gives keywords/operators their own
+    // distinct kind separate from `identifier`. These two tests are the
+    // real regression guard for that (is_clojure_call_head in
+    // src/lang/mod.rs).
+    const CLOJURE_PAIR: &str = r#"
+(defn sum-items [items factor]
+  (let [total (reduce (fn [acc item]
+                         (let [value (* (:price item) (:qty item))]
+                           (if (:discount item)
+                             (+ acc (* value (- 1.0 (:discount item))))
+                             (+ acc value))))
+                       0.0
+                       items)]
+    (+ total (* total factor))))
+
+(defn combine-totals [rows scale]
+  (let [sum (reduce (fn [acc row]
+                       (let [amount (* (:price row) (:qty row))]
+                         (if (:discount row)
+                           (+ acc (* amount (- 1.0 (:discount row))))
+                           (+ acc amount))))
+                     0.0
+                     rows)]
+    (+ sum (* sum scale))))
+"#;
+
+    #[test]
+    fn clojure_renamed_clone_has_identical_fingerprints() {
+        // Same shape, every local variable/parameter renamed, operators and
+        // special forms (defn, let, reduce, fn, if, +, *, -) untouched — a
+        // textbook type-2 clone.
+        let fa = analyze_source(0, Lang::Clojure, CLOJURE_PAIR, 10, false).unwrap();
+        assert_eq!(fa.functions.len(), 2);
+        assert_eq!(fa.functions[0].fingerprints, fa.functions[1].fingerprints);
+    }
+
+    #[test]
+    fn clojure_different_logic_does_not_match() {
+        // Same nesting shape, same literal-type pattern, but different verbs
+        // throughout (max/when/min/- instead of */if/+).
+        let src = r#"
+(defn sum-items [items factor]
+  (let [total (reduce (fn [acc item]
+                         (let [value (* (:price item) (:qty item))]
+                           (if (:discount item)
+                             (+ acc (* value (- 1.0 (:discount item))))
+                             (+ acc value))))
+                       0.0
+                       items)]
+    (+ total (* total factor))))
+
+(defn max-items [items factor]
+  (let [total (reduce (fn [acc item]
+                         (let [value (max (:price item) (:qty item))]
+                           (when (:discount item)
+                             (- acc (min value (/ 1.0 (:discount item)))))
+                           (- acc value)))
+                       0.0
+                       items)]
+    (- total (/ total factor))))
+"#;
+        let fa = analyze_source(0, Lang::Clojure, src, 10, false).unwrap();
         assert_eq!(fa.functions.len(), 2);
         let j = crate::fingerprint::jaccard(
             &fa.functions[0].fingerprints,
